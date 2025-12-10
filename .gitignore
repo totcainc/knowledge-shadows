@@ -1,0 +1,32 @@
+# Backend
+backend/.env
+backend/venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+backend/storage/videos/*
+backend/storage/thumbnails/*
+!backend/storage/videos/.gitkeep
+!backend/storage/thumbnails/.gitkeep
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
