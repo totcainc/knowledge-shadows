@@ -117,8 +117,9 @@ class AnalysisService:
             response_mime_type="application/json",  # Request JSON output
         )
 
-    def _call_gemini(self, prompt: str) -> dict:
-        """Call Gemini API and parse JSON response."""
+    def _call_gemini(self, prompt: str, default_response: dict = None) -> dict:
+        """Call Gemini API and parse JSON response with robust error handling."""
+        response_text = ""
         try:
             response = self.model.generate_content(
                 prompt,
@@ -132,20 +133,41 @@ class AnalysisService:
             if "```json" in response_text:
                 json_start = response_text.find("```json") + 7
                 json_end = response_text.find("```", json_start)
-                response_text = response_text[json_start:json_end].strip()
+                if json_end > json_start:
+                    response_text = response_text[json_start:json_end].strip()
             elif "```" in response_text:
                 json_start = response_text.find("```") + 3
                 json_end = response_text.find("```", json_start)
-                response_text = response_text[json_start:json_end].strip()
+                if json_end > json_start:
+                    response_text = response_text[json_start:json_end].strip()
 
-            return json.loads(response_text)
+            # Try to parse as JSON
+            result = json.loads(response_text)
+
+            # Validate result is a dictionary
+            if not isinstance(result, dict):
+                logger.warning(f"Gemini returned non-dict JSON: {type(result)}")
+                if default_response:
+                    return default_response
+                raise GeminiAnalysisError("Expected JSON object from Gemini")
+
+            return result
 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse Gemini response as JSON: {e}")
-            logger.error(f"Response text: {response_text[:500]}")
+            logger.error(f"Response text: {response_text[:500] if response_text else 'empty'}")
+
+            # Return default response if provided, otherwise raise
+            if default_response:
+                logger.warning("Using default response due to JSON parse error")
+                return default_response
             raise GeminiAnalysisError(f"Invalid JSON response from Gemini: {e}")
+
         except Exception as e:
             logger.error(f"Gemini API error: {e}")
+            if default_response:
+                logger.warning("Using default response due to API error")
+                return default_response
             raise GeminiAnalysisError(f"Gemini API error: {e}")
 
     def extract_chapters(self, transcript: str, duration_seconds: int) -> List[Dict[str, Any]]:

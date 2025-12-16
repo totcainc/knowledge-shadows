@@ -46,7 +46,8 @@ def _upload_file(file_path: str) -> str:
         response = requests.post(
             f"{ASSEMBLYAI_BASE_URL}/upload",
             headers=headers,
-            data=f
+            data=f,
+            timeout=300  # 5 minute timeout for large file uploads
         )
 
     if response.status_code != 200:
@@ -82,7 +83,8 @@ def _create_transcript(audio_url: str, speaker_labels: bool = True) -> str:
     response = requests.post(
         f"{ASSEMBLYAI_BASE_URL}/transcript",
         headers=headers,
-        json=payload
+        json=payload,
+        timeout=30  # 30 second timeout for API request
     )
 
     if response.status_code != 200:
@@ -110,7 +112,7 @@ def _poll_transcript(transcript_id: str, timeout: int = 600) -> dict:
     start_time = time.time()
 
     while True:
-        response = requests.get(endpoint, headers=headers)
+        response = requests.get(endpoint, headers=headers, timeout=30)
 
         if response.status_code != 200:
             raise AssemblyAIError(f"Failed to get transcript status: {response.text}")

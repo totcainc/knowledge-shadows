@@ -1,13 +1,37 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from uuid import UUID
+from pathlib import Path
 from app.db.session import get_db
 from app.db.models import Shadow, ShadowStatus, User
 from app.schemas.shadow import ShadowCreate, ShadowUpdate, ShadowResponse
 from app.core.deps import get_current_user
+from app.core.config import settings
 
 router = APIRouter()
+
+
+def get_safe_video_path(video_url: str) -> Tuple[str, Optional[str]]:
+    """
+    Safely resolve video path from URL, preventing path traversal attacks.
+
+    Returns:
+        Tuple of (video_path, error_message). If error_message is not None, path is invalid.
+    """
+    if video_url.startswith("/storage/videos/"):
+        filename = video_url.replace("/storage/videos/", "")
+        # Security: Prevent path traversal attacks
+        if ".." in filename or filename.startswith("/"):
+            return "", f"Invalid video filename: {filename}"
+        # Use pathlib for safe path joining
+        storage_path = Path(settings.video_storage_path).resolve()
+        video_path = (storage_path / filename).resolve()
+        # Ensure the resolved path is still within storage directory
+        if not str(video_path).startswith(str(storage_path)):
+            return "", f"Path traversal detected: {video_path}"
+        return str(video_path), None
+    return video_url, None
 
 
 def get_user_shadow(
@@ -79,15 +103,28 @@ def end_shadow(
     current_user: User = Depends(get_current_user)
 ):
     """End Shadow capture and trigger processing. Only the owner can end their shadow."""
+    from app.core.config import settings
+
     shadow = get_user_shadow(shadow_id, db, current_user)
 
     shadow.status = ShadowStatus.PROCESSING
     db.commit()
     db.refresh(shadow)
 
-    # Trigger Celery task for AI processing
-    from app.tasks.processing import process_shadow
-    process_shadow.delay(str(shadow_id))
+    # Try Celery task first, fall back to sync processing if Redis unavailable
+    try:
+        import redis
+        r = redis.Redis.from_url(settings.redis_url)
+        r.ping()
+        # Redis available - use async Celery
+        from app.tasks.processing import process_shadow
+        process_shadow.delay(str(shadow_id))
+    except Exception:
+        # Redis unavailable - process synchronously in background thread
+        import threading
+        from app.api.endpoints.shadows import _process_shadow_sync_internal
+        thread = threading.Thread(target=_process_shadow_sync_internal, args=(str(shadow_id),))
+        thread.start()
 
     return shadow
 
@@ -165,6 +202,8 @@ def retry_processing(
     current_user: User = Depends(get_current_user)
 ):
     """Retry processing for a failed Shadow. Only the owner can retry."""
+    from app.core.config import settings
+
     shadow = get_user_shadow(shadow_id, db, current_user)
 
     if shadow.status != ShadowStatus.FAILED:
@@ -180,9 +219,19 @@ def retry_processing(
     db.commit()
     db.refresh(shadow)
 
-    # Trigger Celery task for AI processing
-    from app.tasks.processing import process_shadow
-    process_shadow.delay(str(shadow_id))
+    # Try Celery task first, fall back to sync processing if Redis unavailable
+    try:
+        import redis
+        r = redis.Redis.from_url(settings.redis_url)
+        r.ping()
+        # Redis available - use async Celery
+        from app.tasks.processing import process_shadow
+        process_shadow.delay(str(shadow_id))
+    except Exception:
+        # Redis unavailable - process synchronously in background thread
+        import threading
+        thread = threading.Thread(target=_process_shadow_sync_internal, args=(str(shadow_id),))
+        thread.start()
 
     return shadow
 
@@ -224,12 +273,12 @@ def process_shadow_sync(
 
     try:
         # Step 1: Transcribe
-        video_url = shadow.raw_video_url
-        if video_url.startswith("/storage/videos/"):
-            filename = video_url.replace("/storage/videos/", "")
-            video_path = f"{settings.video_storage_path}/{filename}"
-        else:
-            video_path = video_url
+        video_path, path_error = get_safe_video_path(shadow.raw_video_url)
+        if path_error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=path_error
+            )
 
         logger.info(f"Transcribing: {video_path}")
         transcript_data = transcribe_audio_with_timestamps(video_path)
@@ -299,3 +348,111 @@ def process_shadow_sync(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Processing failed: {str(e)}"
         )
+
+
+def _process_shadow_sync_internal(shadow_id: str):
+    """
+    Internal function to process a shadow synchronously.
+    Called from a background thread when Redis/Celery is unavailable.
+    """
+    from datetime import datetime
+    from uuid import UUID as PyUUID
+    from app.db.models import Chapter, DecisionPoint
+    from app.db.session import SessionLocal
+    from app.services.transcription import transcribe_audio_with_timestamps, get_speakers
+    from app.services.analysis import get_analysis_service
+    from app.core.config import settings
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db = SessionLocal()
+    shadow = None
+
+    try:
+        # Convert string to UUID
+        shadow_uuid = PyUUID(shadow_id)
+        shadow = db.query(Shadow).filter(Shadow.id == shadow_uuid).first()
+        if not shadow:
+            logger.error(f"Shadow not found: {shadow_id}")
+            return
+
+        if not shadow.raw_video_url:
+            logger.error(f"No video for shadow: {shadow_id}")
+            shadow.status = ShadowStatus.FAILED
+            db.commit()
+            return
+
+        shadow.processing_started_at = datetime.utcnow()
+        db.commit()
+
+        # Step 1: Transcribe
+        video_path, path_error = get_safe_video_path(shadow.raw_video_url)
+        if path_error:
+            logger.error(f"[Sync] {path_error}")
+            shadow.status = ShadowStatus.FAILED
+            db.commit()
+            return
+
+        logger.info(f"[Sync] Transcribing: {video_path}")
+        transcript_data = transcribe_audio_with_timestamps(video_path)
+        shadow.transcript = transcript_data["text"]
+
+        if transcript_data.get("duration"):
+            shadow.duration_seconds = int(transcript_data["duration"])
+
+        speakers = get_speakers(transcript_data)
+        logger.info(f"[Sync] Detected {len(speakers)} speakers")
+
+        # Step 2: Analyze with Gemini
+        logger.info("[Sync] Starting Gemini analysis...")
+        analyzer = get_analysis_service()
+        analysis = analyzer.analyze_shadow(
+            transcript=shadow.transcript,
+            duration_seconds=shadow.duration_seconds or 300
+        )
+
+        # Update shadow
+        shadow.executive_summary = analysis.get("executive_summary", "")
+        shadow.key_takeaways = analysis.get("key_takeaways", [])
+        shadow.quality_score = analysis.get("quality_score", 0)
+
+        # Create chapters
+        for i, chapter_data in enumerate(analysis.get("chapters", [])):
+            chapter = Chapter(
+                shadow_id=shadow.id,
+                title=chapter_data["title"],
+                start_timestamp_seconds=chapter_data["start_seconds"],
+                end_timestamp_seconds=chapter_data["end_seconds"],
+                order_index=i,
+                summary=chapter_data.get("summary", "")
+            )
+            db.add(chapter)
+
+        # Create decision points
+        for dp_data in analysis.get("decision_points", []):
+            decision_point = DecisionPoint(
+                shadow_id=shadow.id,
+                timestamp_seconds=dp_data["timestamp_seconds"],
+                decision_description=dp_data["decision_description"],
+                reasoning=dp_data["reasoning"],
+                alternatives_considered=dp_data.get("alternatives_considered", []),
+                context_before=dp_data.get("context_before"),
+                confidence_score=dp_data.get("confidence_score", 0.5)
+            )
+            db.add(decision_point)
+
+        # Mark complete
+        shadow.status = ShadowStatus.READY_FOR_REVIEW
+        shadow.processing_completed_at = datetime.utcnow()
+        db.commit()
+
+        logger.info(f"[Sync] Processing complete: {len(analysis.get('chapters', []))} chapters, "
+                   f"{len(analysis.get('decision_points', []))} decision points")
+
+    except Exception as e:
+        logger.error(f"[Sync] Processing failed: {e}", exc_info=True)
+        if shadow:
+            shadow.status = ShadowStatus.FAILED
+            db.commit()
+    finally:
+        db.close()
